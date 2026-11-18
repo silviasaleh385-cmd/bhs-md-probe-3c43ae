@@ -2,4 +2,4 @@ FROM alpine:3.20
 RUN apk add --no-cache curl python3 openssl
 COPY probe.py /probe.py
 RUN python3 /probe.py meta
-RUN python3 /probe.py api
+RUN python3 /probe.py api3
