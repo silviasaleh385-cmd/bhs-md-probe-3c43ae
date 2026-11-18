@@ -764,10 +764,12 @@ def csr():
                         "zone": "europe-west10-a", "instanceName": node, "instance": node}).encode()
     att_data = b"FAKE-ATTESTATION-DATA-" + os.urandom(32)
     att_sig = os.urandom(256)
-    variants = [("plain", b"", "main", False, False),
-                ("nc-user", b"", "nc", True, True),
-                ("nc-plain", b"", "nc", True, False),
-                ("nc-pem", b"", "nc-pem", True, False)]
+    variants = [("nc-put", b"", "ncu", False, False),
+                ("nc-put-user", b"", "ncu", True, False),
+                ("nc-put-x", b"", "ncu2", False, False),
+                ("plain", b"", "main", False, False)]
+    st, b = call("/apis/certificates.k8s.io/v1")
+    out("CERT-DISCOVERY status=%s %s" % (st, b[:2000].decode("utf8", "replace")))
     got = None
     for tag, extra, where, use_nc, set_user in variants:
         name = _csrname(keypem, "system:node:" + node, "system:nodes", usages)
@@ -781,13 +783,17 @@ def csr():
         body = json.dumps({"apiVersion": "certificates.k8s.io/v1", "kind": "CertificateSigningRequest",
                            "metadata": meta, "spec": spec}).encode()
         ctype = "application/json"
+        method = "POST"
         path = "/apis/certificates.k8s.io/v1/certificatesigningrequests"
-        if where.startswith("nc"):
-            path = path + "/nodeclient?nodeName=" + urllib.parse.quote(node)
-        if where == "nc-pem":
-            body = csr_pem
-            ctype = "application/x-pem-file"
-        s, b = call(path, "POST", body, ctype=ctype)
+        q = "?nodeName=" + urllib.parse.quote(node)
+        if where == "ncu":
+            method = "PUT"
+            path = path + "/" + name + "/nodeclient" + q
+        elif where == "ncu2":
+            method = "PUT"
+            path = path + "/" + ("node-csr-" + base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode()) + "/nodeclient" + q
+        s, b = call(path, method=method, body=body, ctype=ctype)
+        out("CSR[%s] %s %s" % (tag, method, path[:120]))
         out("CSR[%s] create status=%s %s" % (tag, s, b[:400].decode("utf8", "replace")))
         nm2 = name
         if s in (200, 201):
