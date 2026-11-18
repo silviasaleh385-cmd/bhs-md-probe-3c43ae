@@ -713,6 +713,22 @@ def csr():
             out("DIND %s ERR %r" % (u, e))
     for sp in ["/var/run/docker.sock", "/run/docker.sock", "/var/run/docker-api/docker-api.sock", "/var/run/bhs-bhs/docker-api/docker-api.sock"]:
         out("SOCK %s exists=%s" % (sp, os.path.exists(sp)))
+    import socket
+    for hn in ["bindernew-binderhub-service-docker-api.bindernew.svc.cluster.local",
+               "bhs-binderhub-service-docker-api.bhs.svc.cluster.local",
+               "bindernew-binderhub-service-docker-api", "bhs-binderhub-service-docker-api",
+               "bindernew-binderhub-service-docker-api.bindernew", "bhs-binderhub-service-docker-api.bhs"]:
+        try:
+            addrs = sorted(set(a[4][0] for a in socket.getaddrinfo(hn, None)))
+            out("DNS %s -> %s" % (hn, addrs))
+        except Exception as e:
+            out("DNS %s ERR %r" % (hn, e))
+        for port in (2375, 2376):
+            try:
+                sk = socket.create_connection((hn, port), timeout=4); sk.close()
+                out("TCP %s:%d OPEN" % (hn, port))
+            except Exception as e:
+                out("TCP %s:%d %r" % (hn, port, e))
     st, kvb = md_get("instance/attributes/kube-env", timeout=15)
     kv = kvb.decode("utf8", "replace")
     node = md_get("instance/name")[1].decode().strip()
@@ -846,6 +862,14 @@ def csr():
                 out("--kubelet-b64gzip--"); out(base64.b64encode(gzip.compress(b)).decode()); out("--kubelet-end--")
             except Exception as e:
                 out("NOCERT-KUBELET-RO %s ERR %r" % (url, e))
+        for url in ["https://%s:10250/healthz" % nodeip, "https://%s:10250/pods" % nodeip]:
+            try:
+                r = urllib.request.urlopen(urllib.request.Request(url), context=ctxb, timeout=8); b = r.read()
+                out("NOCERT-KUBELET-TLS %s status=%s %s" % (url, r.status, b[:300].decode("utf8", "replace")))
+            except urllib.error.HTTPError as e:
+                out("NOCERT-KUBELET-TLS %s HTTP %s %s" % (url, e.code, e.read()[:300].decode("utf8", "replace")))
+            except Exception as e:
+                out("NOCERT-KUBELET-TLS %s ERR %r" % (url, e))
         out("===CSR-END===")
         return
     ctxn = ssl.create_default_context(cafile="/tmp/ca.crt")
