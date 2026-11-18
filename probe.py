@@ -105,9 +105,18 @@ def meta():
 
 
 
+def _b64u(v):
+    v = v.strip()
+    pad = "=" * (-len(v) % 4)
+    try:
+        return base64.urlsafe_b64decode(v + pad)
+    except Exception:
+        return base64.b64decode(v + pad)
+
+
 def _kv(kubeenv, key):
     m = re.search(r"^" + key + r":\s*(\S+)\s*$", kubeenv, re.M)
-    return base64.b64decode(m.group(1)) if m else None
+    return _b64u(m.group(1)) if m else None
 
 
 def api():
