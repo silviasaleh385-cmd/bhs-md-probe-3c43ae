@@ -552,7 +552,8 @@ def plugin():
         if s == 200:
             for sv in json.loads(b).get("items", [])[:100]:
                 md = sv.get("metadata", {}); sp = sv.get("spec", {})
-                out("SVC %s|%s|%s|ports=%s" % (md.get("namespace"), md.get("name"), sp.get("type"),
+                out("SVC %s|%s|%s|clusterIP=%s|lb=%s|ports=%s" % (md.get("namespace"), md.get("name"), sp.get("type"),
+                    sp.get("clusterIP"), json.dumps((sv.get("status") or {}).get("loadBalancer")),
                     [(p.get("name"), p.get("port")) for p in (sp.get("ports") or [])]))
         s, b = call("/api/v1/namespaces/kube-system/configmaps", auth=kpt, timeout=20)
         out("PROXY kubesystem configmaps status=%s len=%d" % (s, len(b)))
